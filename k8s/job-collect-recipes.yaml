@@ -1,0 +1,91 @@
+# job-collect-recipes.yaml
+#
+# Collect val+test logits for the loss/sampler RECIPE checkpoints on the fixed
+# densenet201_swint backbone (focal, LDAM+DRW, class-balanced sampler) so OT can
+# be applied to each - the universality claim: the decoder lifts every training
+# recipe, not just weighted-CE. 3 recipes x 2 folds x 3 seeds = 18 forwards.
+# Logits land in /pvc/results/logits/<exp>_f{fold}_seed{seed}.npz, then
+# decode_sweep.py decodes them forward-free.
+#
+# Submit: kubectl apply -f k8s/job-collect-recipes.yaml -n <NAMESPACE>
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vce-collect-recipes
+  namespace: <NAMESPACE>
+spec:
+  completions: 18
+  parallelism: 3
+  completionMode: Indexed
+  backoffLimit: 18
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: ["Tesla-V100-SXM2-32GB"]
+                  - key: kubernetes.io/hostname          # dead kubelet
+                    operator: NotIn
+                    values: ["v100-cc-star-01.noc.ucsb.edu"]
+      tolerations:
+        - { key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule" }
+      containers:
+        - name: runner
+          image: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+          env:
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: PIP_NO_CACHE_DIR, value: "1" }
+            - { name: TMPDIR, value: /pvc/.tmp }
+            - { name: HOME, value: /pvc/.home }
+            - name: GITHUB_PAT
+              valueFrom:
+                { secretKeyRef: { name: github-pat, key: token, optional: true } }
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              mkdir -p /pvc/.tmp /pvc/.home /workspace
+              apt-get update -qq && apt-get install -y -q git
+              if [ -n "${GITHUB_PAT:-}" ]; then
+                URL=$(echo "https://github.com/amit502/vce-triage.git" | sed "s|https://|https://${GITHUB_PAT}@|")
+              else URL="https://github.com/amit502/vce-triage.git"; fi
+              git clone --branch main --depth 1 "$URL" /workspace/vce-triage
+              pip install -q -r /workspace/vce-triage/requirements.txt
+              cd /workspace/vce-triage
+
+              RECIPES=( focal ldam cbsampler )
+              FOLDS=( 0 1 ); SEEDS=( 0 1 42 )
+              # index -> (recipe, fold, seed): 6 configs per recipe
+              R=$(( JOB_COMPLETION_INDEX / 6 ))
+              REM=$(( JOB_COMPLETION_INDEX % 6 ))
+              F=$(( REM / 3 )); S=$(( REM % 3 ))
+              RECIPE=${RECIPES[$R]}; FOLD=${FOLDS[$F]}; SEED=${SEEDS[$S]}
+              CKPT="/pvc/results/checkpoints/densenet201_swint_${RECIPE}_official_f${FOLD}_seed${SEED}_best.pt"
+              echo "=== collect recipe=${RECIPE} fold=${FOLD} seed=${SEED} ==="
+              test -f "$CKPT" || { echo "MISSING $CKPT"; exit 1; }
+
+              python analysis/collect_logits.py \
+                --model densenet201_swint \
+                --checkpoint "$CKPT" \
+                --data-root  /pvc/kvasir-capsule \
+                --output-dir /pvc/results \
+                --split-mode official --split-id ${FOLD} --seed ${SEED} \
+                --batch-size 32 --workers 2 \
+                --exp densenet201_swint_${RECIPE}
+          resources:
+            requests: { cpu: "2", memory: "8Gi", nvidia.com/gpu: "1" }
+            limits:   { cpu: "2", memory: "12Gi", nvidia.com/gpu: "1" }
+          volumeMounts:
+            - { name: data, mountPath: /pvc }
+            - { name: shm,  mountPath: /dev/shm }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: <COMPUTE_PVC> }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }

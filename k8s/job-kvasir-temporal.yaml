@@ -1,0 +1,95 @@
+# job-kvasir-temporal.yaml
+#
+# Universality check: sequence-aware (temporal) decoding on the KVASIR OT logits.
+# NON-DESTRUCTIVE by construction:
+#   - copies the 6 otdecode npz into /pvc/results/logits_kvtemporal (originals untouched)
+#   - tags the COPIES with (video_id, frame_number) via KvasirDataset (no re-forward)
+#   - writes decode tables into /pvc/results/kvtemporal (new dir; no --write-summary,
+#     so summary.csv is never touched)
+# Kvasir labelled frames are dense (median inter-frame gap = 1), so smoothing applies.
+# Sweeps window W in {0,3,5,7,11,15,31} x {argmax,la,ot_alpha,ot_reg}, objective f1.
+# CPU only (Kvasir logits are small; sinkhorn is milliseconds).
+#
+# Submit: kubectl apply -f k8s/job-kvasir-temporal.yaml -n <NAMESPACE>
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vce-kvasir-temporal
+  namespace: <NAMESPACE>
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: ["Tesla-V100-SXM2-32GB"]
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["v100-cc-star-01.noc.ucsb.edu"]
+      tolerations:
+        - { key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule" }
+      containers:
+        - name: runner
+          image: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+          env:
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: PIP_NO_CACHE_DIR, value: "1" }
+            - { name: TMPDIR, value: /pvc/.tmp }
+            - { name: HOME, value: /pvc/.home }
+            - name: GITHUB_PAT
+              valueFrom:
+                { secretKeyRef: { name: github-pat, key: token, optional: true } }
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              mkdir -p /pvc/.tmp /pvc/.home /workspace
+              apt-get update -qq && apt-get install -y -q git
+              if [ -n "${GITHUB_PAT:-}" ]; then
+                URL=$(echo "https://github.com/amit502/vce-triage.git" | sed "s|https://|https://${GITHUB_PAT}@|")
+              else URL="https://github.com/amit502/vce-triage.git"; fi
+              git clone --branch main --depth 1 "$URL" /workspace/vce-triage
+              pip install -q pandas scikit-learn iterative-stratification
+              cd /workspace/vce-triage
+
+              SRC=/pvc/results/logits
+              DST=/pvc/results/logits_kvtemporal
+              OUT=/pvc/results/kvtemporal
+              mkdir -p "$DST" "$OUT"
+              echo "############ copy originals (non-destructive) ############"
+              cp -n "$SRC"/densenet201_swint_otdecode_official_f*_seed*.npz "$DST"/ 2>/dev/null || true
+              ls -la "$DST" | grep otdecode
+
+              echo "############ tag COPIES with (video,frame) ############"
+              python analysis/tag_logits_kvasir.py \
+                --root /pvc/kvasir-capsule --logits-dir "$DST" \
+                --exp densenet201_swint_otdecode_official --split-mode official \
+                --folds 0,1 --seeds 0,1,42
+
+              echo "############ temporal window sweep (writes to $OUT only) ############"
+              for W in 0 3 5 7 11 15 31; do
+                echo "################  KVASIR TEMPORAL WINDOW=${W}  (objective=f1, GPU) ################"
+                python analysis/decode_sweep.py --dataset kvasir \
+                  --logits-dir "$DST" --data-root /pvc/kvasir-capsule --output-dir "$OUT" \
+                  --exp-prefix densenet201_swint_otdecode_official \
+                  --objective f1 --temporal-window ${W} --device cuda \
+                  --decoders argmax,la,ot_alpha,ot_reg --no-calens
+              done
+              echo DONE kvasir temporal
+          resources:
+            requests: { cpu: "2", memory: "6Gi", nvidia.com/gpu: "1" }
+            limits:   { cpu: "2", memory: "7Gi", nvidia.com/gpu: "1" }   # <=1.2x request
+          volumeMounts:
+            - { name: out, mountPath: /pvc }
+      volumes:
+        - name: out
+          persistentVolumeClaim: { claimName: <COMPUTE_PVC> }

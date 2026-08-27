@@ -1,0 +1,105 @@
+# job-recipe-screen.yaml
+#
+# Phase A: screen imbalance recipes on the plain baseline (train.py) to pick the
+# best baseline recipe R* before running the consistency method on it (Phase B).
+#
+#   recipes (4): focal | class-balanced sampler | LDAM+DRW | LA (logit-adjust)
+#   folds:   0, 1     seeds: 0, 1, 42     -> 24 = 4 x 2 x 3
+#   reference: existing weighted_ce baseline on V100 = f1 0.238 (not re-run).
+#
+# All on Tesla-V100-SXM2-32GB (matches the V100 baseline's architecture), batch 32,
+# official split, densenet201_swint. FULL DETERMINISM (strict algorithms + math
+# attention + seeded loaders) so runs are bit-reproducible per seed on this one GPU
+# type; CUBLAS_WORKSPACE_CONFIG is set in-env for strict mode. Results -> summary.csv
+# with distinct --experiment tags per recipe.
+#
+# parallelism 3.  Submit: kubectl apply -f k8s/job-recipe-screen.yaml -n <NAMESPACE>
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vce-recipe-screen
+  namespace: <NAMESPACE>
+spec:
+  completions: 24
+  parallelism: 3
+  completionMode: Indexed
+  backoffLimit: 40
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: ["Tesla-V100-SXM2-32GB"]
+      tolerations:
+        - { key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule" }
+      containers:
+        - name: runner
+          image: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+          env:
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: PIP_NO_CACHE_DIR, value: "1" }
+            - { name: CUBLAS_WORKSPACE_CONFIG, value: ":4096:8" }
+            - { name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True" }
+            - { name: TMPDIR, value: /pvc/.tmp }
+            - { name: HOME, value: /pvc/.home }
+            - name: GITHUB_PAT
+              valueFrom:
+                { secretKeyRef: { name: github-pat, key: token, optional: true } }
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              echo "=== SCHEDULED ON: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader) | idx=${JOB_COMPLETION_INDEX} ==="
+              mkdir -p /pvc/.tmp /pvc/.home /workspace
+              apt-get update -qq && apt-get install -y -q git
+              if [ -n "${GITHUB_PAT:-}" ]; then
+                URL=$(echo "https://github.com/amit502/vce-triage.git" | sed "s|https://|https://${GITHUB_PAT}@|")
+              else URL="https://github.com/amit502/vce-triage.git"; fi
+              git clone --branch main --depth 1 "$URL" /workspace/vce-triage
+              pip install -q -r /workspace/vce-triage/requirements.txt
+
+              # index -> (recipe fold seed)
+              CONFIGS=(
+                "focal 0 0" "focal 0 1" "focal 0 42" "focal 1 0" "focal 1 1" "focal 1 42"
+                "cbsampler 0 0" "cbsampler 0 1" "cbsampler 0 42" "cbsampler 1 0" "cbsampler 1 1" "cbsampler 1 42"
+                "ldam 0 0" "ldam 0 1" "ldam 0 42" "ldam 1 0" "ldam 1 1" "ldam 1 42"
+                "laloss 0 0" "laloss 0 1" "laloss 0 42" "laloss 1 0" "laloss 1 1" "laloss 1 42"
+              )
+              read RECIPE FOLD SEED <<< "${CONFIGS[${JOB_COMPLETION_INDEX}]}"
+              case "$RECIPE" in
+                focal)     FLAGS="--loss focal --sampler random" ;;
+                cbsampler) FLAGS="--loss ce --sampler class_balanced" ;;
+                ldam)      FLAGS="--loss ldam --sampler random --drw-epoch 20" ;;
+                laloss)    FLAGS="--loss la_loss --sampler random" ;;
+              esac
+              EXP="densenet201_swint_${RECIPE}_official_f${FOLD}"
+              echo "=== RUN: recipe=${RECIPE} fold=${FOLD} seed=${SEED} exp=${EXP} ==="
+
+              python /workspace/vce-triage/training/train.py \
+                --model       densenet201_swint \
+                --dataset     kvasir \
+                --data-root   /pvc/kvasir-capsule \
+                --output-dir  /pvc/results \
+                --split-mode  official \
+                --split-id    ${FOLD} \
+                --seed        ${SEED} \
+                --batch-size  32 \
+                --experiment  ${EXP} \
+                ${FLAGS}
+          resources:
+            requests: { cpu: "2", memory: "6Gi", nvidia.com/gpu: "1" }
+            limits:   { cpu: "2", memory: "6Gi", nvidia.com/gpu: "1" }
+          volumeMounts:
+            - { name: data, mountPath: /pvc }
+            - { name: shm,  mountPath: /dev/shm }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: <COMPUTE_PVC> }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }

@@ -1,0 +1,75 @@
+# job-galar-patho-temporal.yaml
+#
+# Sequence-aware (temporal) decoding on the GALAR pathology logits, FULL test pool.
+# Step 1: splice (video,frame) tags into the existing npz (CPU, no re-forward).
+# Step 2: sweep temporal window W in {0,15,31} x decoders {argmax,la,ot_alpha,ot_reg,
+# ot_gated}, objective f1 (table also reports recall + mcc). W=0 is the plain baseline;
+# W>0 is within-video +/-W-frame posterior smoothing before decoding. This shows
+# argmax vs temporal+argmax vs temporal+OT with F1/recall/MCC together.
+# Forward-free, CPU, 8Gi (2M-row sinkhorn for the OT rows).
+#
+# Submit: kubectl apply -f k8s/job-galar-patho-temporal.yaml -n <NAMESPACE>
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vce-galar-patho-temporal
+  namespace: <NAMESPACE>
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: runner
+          image: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+          env:
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: PIP_NO_CACHE_DIR, value: "1" }
+            - { name: TMPDIR, value: /pvc/.tmp }
+            - { name: HOME, value: /pvc/.home }
+            - name: GITHUB_PAT
+              valueFrom:
+                { secretKeyRef: { name: github-pat, key: token, optional: true } }
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              mkdir -p /pvc/.tmp /pvc/.home /workspace
+              apt-get update -qq && apt-get install -y -q git
+              if [ -n "${GITHUB_PAT:-}" ]; then
+                URL=$(echo "https://github.com/amit502/vce-triage.git" | sed "s|https://|https://${GITHUB_PAT}@|")
+              else URL="https://github.com/amit502/vce-triage.git"; fi
+              git clone --branch main --depth 1 "$URL" /workspace/vce-triage
+              pip install -q numpy scikit-learn pandas
+              cd /workspace/vce-triage
+
+              echo "############ STEP 1: tag logits with (video,frame) ############"
+              python analysis/tag_logits.py \
+                --splits-dir /pvc/results/galar_pathology_splits \
+                --index /pvc/results/galar_tar_index.pkl \
+                --logits-dir /pvc/results/logits \
+                --exp densenet201_swint_galar_pathology_focal --folds 0,1 --seeds 0,1,42
+
+              echo "############ STEP 2: temporal window sweep ############"
+              for W in 0 15 31; do
+                echo "################  TEMPORAL WINDOW=${W}  (objective=f1, full test) ################"
+                python analysis/decode_sweep.py --dataset galar --galar-task pathology \
+                  --classes-file /pvc/results/galar_pathology_splits/classes.txt \
+                  --logits-dir /pvc/results/logits --output-dir /pvc/results \
+                  --exp-prefix densenet201_swint_galar_pathology_focal \
+                  --prior-source val --objective f1 --temporal-window ${W} \
+                  --rare erythema --mid ulcer --no-calens \
+                  --decoders argmax,la,ot_alpha,ot_reg,ot_gated
+              done
+              echo DONE galar pathology temporal
+          resources:
+            requests: { cpu: "2", memory: "8Gi" }
+            limits:   { cpu: "2", memory: "9Gi" }   # <=1.2x request
+          volumeMounts:
+            - { name: out, mountPath: /pvc }
+      volumes:
+        - name: out
+          persistentVolumeClaim: { claimName: <COMPUTE_PVC> }

@@ -1,0 +1,95 @@
+apiVersion: batch/v1
+kind: Job
+metadata: { name: vce-hcg, namespace: <NAMESPACE> }
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: nvidia.com/gpu.product, operator: In, values: ["Tesla-V100-SXM2-32GB", "Tesla-V100-PCIE-32GB", "NVIDIA-A100-SXM4-80GB", "NVIDIA-A100-PCIE-40GB", "NVIDIA-A100-80GB-PCIe", "NVIDIA-A10", "Quadro-RTX-6000", "NVIDIA-RTX-A6000", "NVIDIA-GeForce-RTX-3090", "NVIDIA-GeForce-RTX-2080-Ti"] }
+                  # exclude nodes with known infra problems:
+                  #   uicnrp-fiona2.evl.uic.edu: broken driver -- "failed to initialize NVML:
+                  #     Driver/library version mismatch" -> pods die with StartError
+                  #   v100-cc-star-01.noc.ucsb.edu: kubelet log-streaming unreachable for every
+                  #     pod scheduled there -> jobs fail (exit 2) with no retrievable logs
+                  - { key: kubernetes.io/hostname, operator: NotIn,
+                      values: ["uicnrp-fiona2.evl.uic.edu", "v100-cc-star-01.noc.ucsb.edu"] }
+      tolerations:
+        - { key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule" }
+      containers:
+        - name: runner
+          image: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+          env:
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: PIP_NO_CACHE_DIR, value: "1" }
+            - { name: TMPDIR, value: /pvc/.tmp }
+            - { name: HOME, value: /pvc/.home }
+            - name: GITHUB_PAT
+              valueFrom: { secretKeyRef: { name: github-pat, key: token, optional: true } }
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              mkdir -p /pvc/.tmp /pvc/.home /workspace
+              apt-get update -qq && apt-get install -y -q git
+              if [ -n "${GITHUB_PAT:-}" ]; then
+                URL=$(echo "https://github.com/amit502/vce-triage.git" | sed "s|https://|https://${GITHUB_PAT}@|")
+              else URL="https://github.com/amit502/vce-triage.git"; fi
+              git clone --branch main --depth 1 "$URL" /workspace/vce-triage
+              cd /workspace/vce-triage
+              pip install -q -r requirements.txt
+              pip install -q numpy scikit-learn scipy
+
+              echo "############ generate Kvasir logits from the FOCAL checkpoint (was weighted_ce) ############"
+              for FOLD in 0 1; do
+                for SEED in 0 1 42; do
+                  OUT="/pvc/results/logits/densenet201_swint_focal_otdecode_official_f${FOLD}_seed${SEED}.npz"
+                  if [ -f "$OUT" ]; then
+                    echo "SKIP (exists) $OUT"; continue
+                  fi
+                  CKPT="/pvc/results/checkpoints/densenet201_swint_focal_official_f${FOLD}_seed${SEED}_best.pt"
+                  test -f "$CKPT" || { echo "MISSING $CKPT"; exit 1; }
+                  python analysis/metric_optimal_decode.py \
+                    --model densenet201_swint --checkpoint "$CKPT" \
+                    --data-root /pvc/kvasir-capsule --output-dir /pvc/results \
+                    --split-mode official --split-id ${FOLD} --seed ${SEED} \
+                    --batch-size 32 --workers 2 \
+                    --experiment densenet201_swint_focal_otdecode_official_f${FOLD}
+                done
+              done
+
+              echo "############ tag with (video,frame) for temporal/HCE/PACT decoding ############"
+              mkdir -p /pvc/results/logits_kvtemporal
+              cp -n /pvc/results/logits/densenet201_swint_focal_otdecode_official_f*_seed*.npz \
+                /pvc/results/logits_kvtemporal/
+              python analysis/tag_logits_kvasir.py \
+                --root /pvc/kvasir-capsule --logits-dir /pvc/results/logits_kvtemporal \
+                --exp densenet201_swint_focal_otdecode_official --split-mode official \
+                --folds 0,1 --seeds 0,1,42
+
+              echo "############ full decode sweep: kvasir, galar_pathology, kvasir_cbsampler ############"
+              rm -f /pvc/results/experimental/results_hcg.csv /pvc/results/experimental/results_hcg_significance.csv \
+                    /pvc/results/experimental/results_hcg_kvasir_cbsampler.csv \
+                    /pvc/results/experimental/results_hcg_significance_kvasir_cbsampler.csv
+              for DS in kvasir galar_pathology kvasir_cbsampler; do
+                python analysis/hcg_decode.py --dataset ${DS} --device cuda
+                python analysis/hcg_decode.py --dataset ${DS} --device cuda --ensemble
+              done
+              echo DONE hcg
+          resources:
+            requests: { cpu: "2", memory: "20Gi", nvidia.com/gpu: "1" }
+            limits:   { cpu: "2", memory: "24Gi", nvidia.com/gpu: "1" }
+          volumeMounts:
+            - { name: out, mountPath: /pvc }
+            - { name: shm,  mountPath: /dev/shm }
+      volumes:
+        - { name: out, persistentVolumeClaim: { claimName: <COMPUTE_PVC> } }
+        - { name: shm,  emptyDir: { medium: Memory, sizeLimit: 2Gi } }

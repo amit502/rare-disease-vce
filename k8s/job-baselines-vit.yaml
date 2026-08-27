@@ -1,0 +1,133 @@
+# job-baselines-vit.yaml
+#
+# ViT baselines: 4 models, 2 folds, sequential per seed.
+#   - vit_small  : ViT-S/16, ImageNet-21k supervised init (patch16)
+#   - vit_large  : ViT-L/16, ImageNet-21k supervised init (patch16)
+#   - dinov2_vits: ViT-S/14, LVD-142M self-supervised init (DINOv2)
+#   - dinov2_vitl: ViT-L/14, LVD-142M self-supervised init (DINOv2)
+#
+# ImageNet vs LVD-142M comparison shows the value of pretraining data.
+# All 4 use unified recipe: AdamW lr=1e-4, cosine, 50 epochs, weighted CE.
+# ViT-L and DINOv2-ViT-L use batch_size=16 (GPU memory constraint).
+#
+# To add seeds later, change:  SEEDS="42"  →  SEEDS="42 0 1"
+#
+# Estimated time per seed: ~4h (ViT-S) + ~12h (ViT-L) + ~4h (DINOv2-S) + ~12h (DINOv2-L) = ~32h
+#
+# Submit: kubectl apply -f k8s/job-baselines-vit.yaml -n <NAMESPACE>
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vce-baselines-vit
+  namespace: <NAMESPACE>
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - Tesla-V100-SXM2-32GB
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: runner
+          image: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PIP_NO_CACHE_DIR
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: TMPDIR
+              value: /pvc/.tmp
+            - name: HOME
+              value: /pvc/.home
+            - name: GITHUB_PAT
+              valueFrom:
+                secretKeyRef:
+                  name: github-pat
+                  key: token
+                  optional: true
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              mkdir -p /pvc/.tmp /pvc/.home /workspace
+
+              apt-get update -qq && apt-get install -y -q git
+
+              if [ -n "${GITHUB_PAT:-}" ]; then
+                CLONE_URL=$(echo "https://github.com/amit502/vce-triage.git" | sed "s|https://|https://${GITHUB_PAT}@|")
+              else
+                CLONE_URL="https://github.com/amit502/vce-triage.git"
+              fi
+              git clone --branch main --depth 1 "$CLONE_URL" /workspace/vce-triage
+              pip install -q -r /workspace/vce-triage/requirements.txt
+
+              TRAIN="python /workspace/vce-triage/training/train.py
+                --dataset kvasir
+                --data-root /pvc/kvasir-capsule
+                --output-dir /pvc/results
+                --split-mode official"
+
+              # ── seeds and folds ───────────────────────────────────────────
+              # To add seeds: change SEEDS="42" to SEEDS="42 0 1"
+              SEEDS="42"
+
+              for SEED in $SEEDS; do
+                for FOLD in 0 1; do
+
+                  # DINOv2 runs first — fold 0 checkpoint ready for pretraining ASAP
+                  echo "=== DINOv2-ViT-S/14 LVD-142M  fold=${FOLD}  seed=${SEED} ==="
+                  $TRAIN --model dinov2_vits --split-id $FOLD --seed $SEED \
+                    --experiment dinov2_vits_kvasir_official_f${FOLD}_seed${SEED}
+
+                  echo "=== DINOv2-ViT-L/14 LVD-142M  fold=${FOLD}  seed=${SEED} ==="
+                  $TRAIN --model dinov2_vitl --split-id $FOLD --seed $SEED \
+                    --experiment dinov2_vitl_kvasir_official_f${FOLD}_seed${SEED}
+
+                  echo "=== ViT-S/16 ImageNet  fold=${FOLD}  seed=${SEED} ==="
+                  $TRAIN --model vit_small --split-id $FOLD --seed $SEED \
+                    --experiment vit_small_kvasir_official_f${FOLD}_seed${SEED}
+
+                  echo "=== ViT-L/16 ImageNet  fold=${FOLD}  seed=${SEED} ==="
+                  $TRAIN --model vit_large --split-id $FOLD --seed $SEED \
+                    --experiment vit_large_kvasir_official_f${FOLD}_seed${SEED}
+
+                done
+              done
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /pvc
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: <COMPUTE_PVC>
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi

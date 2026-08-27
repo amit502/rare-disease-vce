@@ -1,0 +1,97 @@
+# job-galar-pathology-focal.yaml
+#
+# GALAR `pathology` (single-label multiclass rare-disease) baseline with FOCAL loss,
+# the cross-dataset analog to Kvasir with GENUINELY rare classes. Video-disjoint
+# 2-fold split (split_0/1) built by analysis/build_galar_pathology.py x 3 seeds =
+# 6 runs. Natural class skew is PRESERVED: train caps only the giant classes
+# (normal/blood) at 40k while keeping every rarer class fully intact; val/test are
+# uniform subsamples (skew intact) so argmax still collapses rare classes and the OT
+# prior stays honest. Frames read from tar shards via the offset index.
+#
+# Prereq: galar_tar_index.pkl AND /pvc/results/galar_pathology_splits (from
+#         vce-galar-patho-build with --min-frames 1000 -> 10 classes).
+# Submit: kubectl apply -f k8s/job-galar-pathology-focal.yaml -n <NAMESPACE>
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vce-galar-patho-focal
+  namespace: <NAMESPACE>
+spec:
+  completions: 6
+  parallelism: 3
+  completionMode: Indexed
+  backoffLimit: 12
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          # LOCKED to V100-32GB for reproducibility (strict determinism is only
+          # bit-reproducible per seed on a single GPU product; V100 is schedulable).
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values: ["Tesla-V100-SXM2-32GB"]
+                  - key: kubernetes.io/hostname          # dead kubelet
+                    operator: NotIn
+                    values: ["v100-cc-star-01.noc.ucsb.edu"]
+      tolerations:
+        - { key: "nvidia.com/gpu", operator: "Exists", effect: "NoSchedule" }
+      containers:
+        - name: runner
+          image: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+          env:
+            - { name: PYTHONUNBUFFERED, value: "1" }
+            - { name: PIP_NO_CACHE_DIR, value: "1" }
+            - { name: CUBLAS_WORKSPACE_CONFIG, value: ":4096:8" }
+            - { name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True" }
+            - { name: TMPDIR, value: /pvc/.tmp }
+            - { name: HOME, value: /pvc/.home }
+            - name: GITHUB_PAT
+              valueFrom:
+                { secretKeyRef: { name: github-pat, key: token, optional: true } }
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              mkdir -p /pvc/.tmp /pvc/.home /workspace
+              apt-get update -qq && apt-get install -y -q git
+              if [ -n "${GITHUB_PAT:-}" ]; then
+                URL=$(echo "https://github.com/amit502/vce-triage.git" | sed "s|https://|https://${GITHUB_PAT}@|")
+              else URL="https://github.com/amit502/vce-triage.git"; fi
+              git clone --branch main --depth 1 "$URL" /workspace/vce-triage
+              pip install -q -r /workspace/vce-triage/requirements.txt
+              cd /workspace/vce-triage
+              test -f /pvc/results/galar_tar_index.pkl || { echo "MISSING galar_tar_index.pkl"; exit 1; }
+              test -f /pvc/results/galar_pathology_splits/classes.txt || { echo "MISSING pathology splits"; exit 1; }
+
+              CONFIGS=( "0 0" "0 1" "0 42" "1 0" "1 1" "1 42" )
+              read FOLD SEED <<< "${CONFIGS[${JOB_COMPLETION_INDEX}]}"
+              echo "=== GALAR pathology focal fold=${FOLD} seed=${SEED} ==="
+              python training/train.py \
+                --model densenet201_swint --dataset galar --galar-task pathology \
+                --data-root /galar/galar --galar-index /pvc/results/galar_tar_index.pkl \
+                --galar-splits-dir /pvc/results/galar_pathology_splits \
+                --output-dir /pvc/results \
+                --split-mode official --split-id ${FOLD} --seed ${SEED} \
+                --loss focal --focal-gamma 2.0 --sampler random \
+                --epochs 30 --patience 8 --batch-size 64 --workers 24 --prefetch 6 --amp \
+                --galar-max-per-class 40000 --galar-eval-frac 0.1 \
+                --experiment densenet201_swint_galar_pathology_focal_official_f${FOLD}
+          resources:
+            requests: { cpu: "20", memory: "32Gi", nvidia.com/gpu: "1" }   # many workers to hide CephFS latency + PNG decode
+            limits:   { cpu: "24", memory: "38Gi", nvidia.com/gpu: "1" }   # <=1.2x request
+          volumeMounts:
+            - { name: galar, mountPath: /galar, readOnly: true }
+            - { name: out,   mountPath: /pvc }
+            - { name: shm,   mountPath: /dev/shm }
+      volumes:
+        - name: galar
+          persistentVolumeClaim: { claimName: <GALAR_DATA_PVC> }
+        - name: out
+          persistentVolumeClaim: { claimName: <COMPUTE_PVC> }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 14Gi }
