@@ -1,0 +1,12 @@
+normal
+blood
+erosion
+hematin
+angiectasia
+polyp
+lymphangioectasis
+cancer
+ulcer
+erythema
+foreign body
+IBD

@@ -20,6 +20,14 @@ not part of this release).
   already have the raw GALAR shards and are pointing `--galar-root`/`--shards-dir` at them.
   **Full end-to-end reproduction is achievable for Kvasir-Capsule; for GALAR, reproduction is
   blocked on obtaining that dataset separately, not on anything in this code.**
+- The exact GALAR pathology split we used (2-fold, video-disjoint, fold $k$ tests on set $k$)
+  is included under `tables/report/galar_pathology_splits/` (`split_0/{train,val,test}.csv`,
+  `split_1/{train,val,test}.csv`, `classes.txt`), each row is `label,path` (a relative
+  `video/frame_NNNNNN.PNG` path), no image content. `build_galar_pathology.py` is fully
+  deterministic given the same raw GALAR CSVs (every set is sorted before use, the only
+  randomness is a seeded RNG), so re-running it should reproduce this exactly, but we ship
+  the actual split files too so reproduction doesn't depend on your copy of raw GALAR being
+  byte-identical to ours.
 
 ## Environment
 
