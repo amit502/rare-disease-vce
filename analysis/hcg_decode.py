@@ -550,6 +550,12 @@ def run(ds, ensemble):
             f = D.f1m(vY, (vlog - tau * lp[None, :]).argmax(1))
             if f > btf:
                 btf, bt = f, tau
+        # LA-vs-argmax diagnostic: bt=0.0 means the val sweep picked "no adjustment" as
+        # macro-F1-optimal, so LA legitimately degenerates to argmax bit-for-bit -- not a bug,
+        # but printed explicitly so it's checkable per (dataset, fold, seed) rather than inferred.
+        print(f"    LA_TAU_CHECK dataset={ds} fold={fold} seed={seed} selected_tau={bt:.3f} "
+              f"val_f1_at_tau={btf:.4f} val_f1_at_argmax={D.f1m(vY, vlog.argmax(1)):.4f} "
+              f"la_equals_argmax={bt == 0.0}", flush=True)
         acc["la_tau"].append((tlog - bt * lp[None, :]).argmax(1))
 
         vbaseL = D.temporal_smooth(vL, vg, vf, W_TEMP)
@@ -794,17 +800,21 @@ def run(ds, ensemble):
     prev = support / max(support.sum(), 1)
     rare = sorted(np.argsort(prev)[:max(1, K // 3)].tolist())
 
-    # companion dump (hce/pact predictions + labels/video-groups per fold) so a downstream script
+    # companion dump (per-method predictions + labels/video-groups per fold) so a downstream script
     # can bootstrap-compare two DIFFERENT configs (e.g. cbsampler vs focal) head-to-head on the
     # same videos -- results_hcg.csv only has aggregated means, this is what's needed instead.
+    # Also dumps the BASELINE methods, not just hce/pact: per-video (per-patient) rare-finding
+    # detection rate -- "did the method flag >=1 frame of class c in a video that contains c" --
+    # is the triage-relevant unit and cannot be recovered from the pooled confusion matrices or
+    # the aggregated CSV, it needs per-frame predictions alongside their video ids.
     cmp_dir = "/pvc/results/experimental"
     os.makedirs(cmp_dir, exist_ok=True)
     tag_ = "ens" if ensemble else "single"
+    CMP_METHODS = ["argmax", "la_tau", "ot_alpha", "mean_temporal", "ega_b4", "hce", "pact"]
+    cmp_arrays = {m: np.array(acc.get(m, []), dtype=object) for m in CMP_METHODS if m in acc}
     np.savez(os.path.join(cmp_dir, f"cmp_preds_{ds}_{tag_}.npz"),
               YT=np.array(YT, dtype=object), TG=np.array(TG, dtype=object),
-              hce=np.array(acc.get("hce", []), dtype=object),
-              pact=np.array(acc.get("pact", []), dtype=object),
-              K=K, lab=np.array(lab), rare=np.array(rare))
+              K=K, lab=np.array(lab), rare=np.array(rare), **cmp_arrays)
 
     macro, rareR, rareP, rareF = {}, {}, {}, {}
     for m in methods:
@@ -1009,6 +1019,32 @@ def run(ds, ensemble):
                 sig_rows.append([ds, tag, pm, "video_cluster_bootstrap", nm,
                                  f"{np.mean(ds_):.4f}", f"{combined_p:.4g}",
                                  f"{np.mean(cilo_):.4f}", f"{np.mean(cihi_):.4f}"])
+
+    # HCE vs OT: same per-video cluster bootstrap machinery as the pact/hce-vs-mean_temporal
+    # block above, comparator swapped to ot_alpha since OT (not temporal) is the strongest
+    # baseline and the one HCE's headline comparison should be tested against. Written with a
+    # distinct "test" label (video_cluster_bootstrap_vs_ot) so it doesn't collide with the
+    # vs-temporal rows above under the same schema; existing readers that filter on
+    # test=="video_cluster_bootstrap" are unaffected and simply skip these new rows.
+    if "hce" in methods and "ot_alpha" in acc:
+        print(f"--- hce vs ot_alpha, paired ({len(YT)} runs, FULL swept config) ---", flush=True)
+        per_run_boot_ot = []
+        for i, p in enumerate(acc["hce"]):
+            per_run_boot_ot.append(_boot_pvalue(YT[i], np.asarray(p), np.asarray(acc["ot_alpha"][i]),
+                                                 TG[i], K, lab, rare, seed=i))
+        for nm in ("F1", "MCC", "rareRec", "rarePrec", "rareF1"):
+            ds_ = [r[nm][0] for r in per_run_boot_ot]
+            ps_ = [r[nm][1] for r in per_run_boot_ot]
+            cilo_ = [r[nm][2] for r in per_run_boot_ot]
+            cihi_ = [r[nm][3] for r in per_run_boot_ot]
+            combined_p = _fisher_combine(ps_)
+            per_fold = " | ".join(f"fold{i}:d={r[nm][0]:+.4f},p={r[nm][1]:.4g}"
+                                  for i, r in enumerate(per_run_boot_ot))
+            print(f"  hce          {nm:<8} per-video-boot combined_p={combined_p:.4g}  "
+                  f"CI=[{np.mean(cilo_):+.4f},{np.mean(cihi_):+.4f}]  [{per_fold}]", flush=True)
+            sig_rows.append([ds, tag, "hce", "video_cluster_bootstrap_vs_ot", nm,
+                             f"{np.mean(ds_):.4f}", f"{combined_p:.4g}",
+                             f"{np.mean(cilo_):.4f}", f"{np.mean(cihi_):.4f}"])
 
     sig_outp = f"/pvc/results/experimental/results_hcg_significance{suffix}.csv"
     sig_hdr = not os.path.exists(sig_outp)
